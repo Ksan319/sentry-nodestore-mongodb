@@ -13,6 +13,10 @@ from sentry.utils.codecs import Codec, ZstdCodec
 
 class MongoNodeStorage(NodeStorage):
 
+    compression_strategies: Mapping[str, Codec[bytes, bytes]] = {
+        "zstd": ZstdCodec(),
+    }
+
     def __init__(
             self,
             # Mongo
@@ -20,6 +24,7 @@ class MongoNodeStorage(NodeStorage):
             db_name="sentry_nodestore",
             collection_name="sentry_nodestore",
             default_ttl_days=None,  # TTL в днях
+            compression="zstd",
             # Minio
             read_from_s3=False,
             region_name=None,
@@ -42,6 +47,7 @@ class MongoNodeStorage(NodeStorage):
         self.db = self.mongo_client[self.db_name]
         self.collection = self.db[self.collection_name]
         self.default_ttl_days = default_ttl_days
+        self.compression = compression
 
         if self.default_ttl_days:
             try:
@@ -87,10 +93,21 @@ class MongoNodeStorage(NodeStorage):
 
     # Set
     def _set_bytes(self, id: str, data: bytes, ttl: timedelta | None = None) -> None:
+        content_encoding = ''
+        if self.compression:
+            codec = self.compression_strategies[self.compression]
+            compressed_data = codec.encode(data)
+
+            # Check if compression is worth it, otherwise store the data uncompressed
+            if len(compressed_data) <= len(data):
+                data = compressed_data
+                content_encoding = self.compression
+
         created_dt = datetime.combine(datetime.utcnow().date(), datetime.min.time())
         doc = {
             '_id': id,
             'data': data,
+            'content_encoding': content_encoding,
             'created_day': created_dt
         }
         try:
@@ -102,7 +119,9 @@ class MongoNodeStorage(NodeStorage):
     def _get_bytes(self, id: str) -> bytes | None:
         doc = self.collection.find_one({'_id': id})
         if doc:
-            return doc['data']
+            data = doc['data']
+            codec = self.compression_strategies.get(doc['content_encoding'])
+            return codec.decode(data) if codec else data
         if self.read_from_s3:
             return self.__read_from_bucket(id)
         return None
@@ -117,10 +136,6 @@ class MongoNodeStorage(NodeStorage):
     def cleanup(self, cutoff_timestamp: datetime) -> None:
         return None
 
-    # Minio
-    compression_strategies: Mapping[str, Codec[bytes, bytes]] = {
-        "zstd": ZstdCodec(),
-    }
 
     def __get_key_for_id(self, id: str) -> str:
         if self.bucket_path is None:
