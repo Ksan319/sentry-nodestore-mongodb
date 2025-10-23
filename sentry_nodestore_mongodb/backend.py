@@ -127,10 +127,34 @@ class MongoNodeStorage(NodeStorage):
         return None
 
     def _get_bytes_multi(self, ids: list[str]) -> dict[str, bytes | None]:
-        # Находим все документы с _id в списке ids
+        """
+        Быстрая массовая загрузка документов из MongoDB с учётом сжатия
+        и fallback на S3.
+        """
+
+        # 1. Получаем все документы из MongoDB
         docs = self.collection.find({'_id': {'$in': ids}})
-        doc_map = {doc['_id']: doc['data'] for doc in docs}
-        return {id_: doc_map.get(id_, None) for id_ in ids}
+
+        result: dict[str, bytes | None] = {}
+
+        # 2. Обрабатываем каждый найденный документ
+        for doc in docs:
+            data = doc['data']
+            codec = self.compression_strategies.get(doc.get('content_encoding'))
+            result[doc['_id']] = codec.decode(data) if codec else data
+
+        # 3. Для отсутствующих документов — читаем из S3, если нужно
+        if self.read_from_s3:
+            missing_ids = [id_ for id_ in ids if id_ not in result]
+            for id_ in missing_ids:
+                result[id_] = self.__read_from_bucket(id_)
+
+        # 4. Для оставшихся, которых нет в БД и S3 — None
+        for id_ in ids:
+            if id_ not in result:
+                result[id_] = None
+
+        return result
 
     # Cleanup
     def cleanup(self, cutoff_timestamp: datetime) -> None:
